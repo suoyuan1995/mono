@@ -237,6 +237,8 @@ typedef struct {
 	 * Number of times this thread has been resumed using resume_thread ().
 	 */
 	guint32 resume_count;
+	guint32 resume_count_internal;
+	guint32 suspend_count;
 
 	MonoInternalThread *thread;
 
@@ -727,8 +729,8 @@ static MonoCoopCond debugger_thread_exited_cond;
 /* Mutex for the cond var above */
 static MonoCoopMutex debugger_thread_exited_mutex;
 
-/* The single step request instance */
-static SingleStepReq *the_ss_req;
+/* The single step request instances */
+static GPtrArray *the_ss_reqs;
 
 #ifdef MONO_ARCH_SOFT_DEBUG_SUPPORTED
 /* Number of single stepping operations in progress */
@@ -835,6 +837,9 @@ static void ids_cleanup (void);
 
 static void suspend_init (void);
 
+static void ss_req_init (void);
+static void ss_req_cleanup (void);
+
 #ifdef RUNTIME_IL2CPP
 static Il2CppSequencePoint* il2cpp_find_catch_sequence_point(DebuggerTlsData *tls);
 static void ss_start_il2cpp(SingleStepReq *ss_req, DebuggerTlsData *tls, Il2CppSequencePoint *catchFrameSp);
@@ -845,7 +850,7 @@ static void ss_start (SingleStepReq *ss_req, MonoMethod *method, SeqPoint *sp, M
 #endif // RUNTIME_IL2CPP
 static ErrorCode ss_create (MonoInternalThread *thread, StepSize size, StepDepth depth, StepFilter filter, EventRequest *req);
 static void ss_destroy (SingleStepReq *req);
-static SingleStepReq* ss_req_acquire (void);
+SingleStepReq* ss_req_acquire (MonoInternalThread *thread);
 static void ss_req_release (SingleStepReq *req);
 
 static void start_debugger_thread (void);
@@ -1179,6 +1184,7 @@ mono_debugger_agent_init (void)
 	ids_init ();
 	objrefs_init ();
 	breakpoints_init ();
+	ss_req_init ();
 	suspend_init ();
 
 	update_mdb_optimizations ();
@@ -1282,6 +1288,7 @@ mono_debugger_agent_cleanup (void)
 	stop_debugger_thread ();
 
 	breakpoints_cleanup ();
+	ss_req_cleanup ();
 	objrefs_cleanup ();
 	ids_cleanup ();
 }
@@ -2968,6 +2975,8 @@ reset_native_thread_suspend_state (gpointer key, gpointer value, gpointer user_d
 		tls->async_state.valid = FALSE;
 		invalidate_frames (tls);
 	}
+	tls->resume_count_internal++;
+
 }
 
 typedef struct {
@@ -3094,17 +3103,22 @@ process_suspend (DebuggerTlsData *tls, MonoContext *ctx)
 
 /* Conditionally call process_suspend depending oh the current state */
 static gboolean
-try_process_suspend (DebuggerTlsData *tls, MonoContext *ctx)
+try_process_suspend (DebuggerTlsData *tls, MonoContext *ctx, gboolean from_breakpoint)
 {
 	if (suspend_count > 0) {
 		/* Fastpath during invokes, see in process_suspend () */
-		if (suspend_count - tls->resume_count == 0)
+		/* if there is a suspend pending but this thread is already resumed, we shouldn't suspend it again and the breakpoint/ss can run */
+		if (suspend_count - tls->resume_count == 0) 
 			return FALSE;
-		if (tls->invoke)
+		/* if there is in a invoke the breakpoint/step should be executed even with the suspend pending */
+		if (tls->invoke) 
+			return FALSE;
+		/* with the multithreaded single step check if there is a suspend_count pending in the current thread and not in the vm */
+		if (from_breakpoint && tls->suspend_count <= tls->resume_count_internal)
 			return FALSE;
 		process_suspend (tls, ctx);
 		return TRUE;
-	}
+	} /* if there isn't any suspend pending, the breakpoint/ss will be executed and will suspend then vm when the event is sent */
 	return FALSE;
 }
 
@@ -3210,6 +3224,8 @@ resume_thread (MonoInternalThread *thread)
 	DEBUG_PRINTF (1, "[sdb] Resuming thread %p...\n", (gpointer)(gssize)thread->tid);
 
 	tls->resume_count += suspend_count;
+	tls->resume_count_internal += tls->suspend_count;
+	tls->suspend_count = 0;
 
 	/* 
 	 * Signal suspend_count without decreasing suspend_count, the threads will wake up
@@ -4223,6 +4239,8 @@ process_event (EventKind event, gpointer arg, gint32 il_offset, MonoContext *ctx
 		 * returns.
 		 */
 		save_thread_context (ctx);
+		DebuggerTlsData *tls = (DebuggerTlsData *)mono_g_hash_table_lookup (thread_to_tls,  mono_thread_internal_current ());
+		tls->suspend_count++;
 		suspend_vm ();
 
 		if (keepalive_obj)
@@ -5601,7 +5619,7 @@ process_breakpoint (DebuggerTlsData *tls, gboolean from_signal)
 	SeqPoint sp;
 	gboolean found_sp;
 
-	if (try_process_suspend (tls, ctx))
+	if (try_process_suspend (tls, ctx, TRUE))
 		return;
 
 	// FIXME: Speed this up
@@ -5990,20 +6008,17 @@ process_single_step_inner (DebuggerTlsData *tls, gboolean from_signal)
 	if (from_signal)
 		mono_arch_skip_single_step (ctx);
 
-	if (try_process_suspend (tls, ctx))
+	if (try_process_suspend (tls, ctx, FALSE))
 		return;
 
 	/*
 	 * This can run concurrently with a clear_event_request () call, so needs locking/reference counts.
 	 */
-	ss_req = ss_req_acquire ();
+	ss_req = ss_req_acquire (mono_thread_internal_current());
 
 	if (!ss_req)
 		// FIXME: A suspend race
 		return;
-
-	if (mono_thread_internal_current () != ss_req->thread)
-		goto exit;
 
 	ip = (guint8 *)MONO_CONTEXT_GET_IP (ctx);
 
@@ -6201,6 +6216,24 @@ debugger_agent_breakpoint_from_context (MonoContext *ctx)
 		MONO_CONTEXT_SET_IP (ctx, orig_ip);
 }
 #endif // !RUNTIME_IL2CPP
+
+static void
+ss_req_init (void)
+{
+	the_ss_reqs = g_ptr_array_new ();
+}
+
+static void
+ss_req_cleanup (void)
+{
+	dbg_lock ();
+
+	g_ptr_array_free (the_ss_reqs, TRUE);
+
+	the_ss_reqs = NULL;
+
+	dbg_unlock ();
+}
 
 /*
  * start_single_stepping:
@@ -6749,12 +6782,6 @@ ss_create (MonoInternalThread *thread, StepSize size, StepDepth depth, StepFilte
 
 	wait_for_suspend ();
 
-	// FIXME: Multiple requests
-	if (the_ss_req) {
-		DEBUG_PRINTF (0, "Received a single step request while the previous one was still active.\n");
-		return ERR_NOT_IMPLEMENTED;
-	}
-
 	DEBUG_PRINTF (1, "[dbg] Starting single step of thread %p (depth=%s).\n", thread, ss_depth_to_string (depth));
 
 	SingleStepReq *ss_req = g_new0 (SingleStepReq, 1);
@@ -6882,7 +6909,7 @@ ss_create (MonoInternalThread *thread, StepSize size, StepDepth depth, StepFilte
 
 	ss_req->start_method = method;
 
-	the_ss_req = ss_req;
+	g_ptr_array_add (the_ss_reqs, ss_req);
 
 	ss_start (ss_req, method, sp, info, set_ip ? &tls->restore_state.ctx : &tls->context.ctx, tls, step_to_catch, frames, nframes);
 
@@ -6922,17 +6949,27 @@ ss_clear_for_assembly (SingleStepReq *req, MonoAssembly *assembly)
 	}
 }
 
-static SingleStepReq*
-ss_req_acquire (void)
+SingleStepReq*
+ss_req_acquire (MonoInternalThread *thread)
 {
-	SingleStepReq *req;
-
+	SingleStepReq *req = NULL;
 	dbg_lock ();
-	req = the_ss_req;
-	if (req)
-		req->refcount ++;
+	int i;
+	for (i = 0; i < the_ss_reqs->len; ++i) {
+		SingleStepReq *current_req = (SingleStepReq *)g_ptr_array_index (the_ss_reqs, i);
+		if (current_req->thread == thread) {
+			current_req->refcount ++;	
+			req = current_req;
+		}
+	}
 	dbg_unlock ();
 	return req;
+}
+
+int
+ss_req_count ()
+{
+	return the_ss_reqs->len;
 }
 
 static void
@@ -6945,9 +6982,11 @@ ss_req_release (SingleStepReq *req)
 	req->refcount --;
 	if (req->refcount == 0)
 		free = TRUE;
-	dbg_unlock ();
-	if (free)
+	if (free) {
+		g_ptr_array_remove (the_ss_reqs, req);
 		ss_destroy (req);
+	}
+	dbg_unlock ();
 }
 
 /*
@@ -8290,10 +8329,8 @@ clear_event_request (int req_id, int etype)
 		if (req->id == req_id && req->event_kind == etype) {
 			if (req->event_kind == EVENT_KIND_BREAKPOINT)
 				clear_breakpoint ((MonoBreakpoint *)req->info);
-			if (req->event_kind == EVENT_KIND_STEP) {
+			if (req->event_kind == EVENT_KIND_STEP && the_ss_reqs)
 				ss_req_release ((SingleStepReq *)req->info);
-				the_ss_req = NULL;
-			}
 			if (req->event_kind == EVENT_KIND_METHOD_ENTRY)
 				clear_breakpoint ((MonoBreakpoint *)req->info);
 			if (req->event_kind == EVENT_KIND_METHOD_EXIT)
