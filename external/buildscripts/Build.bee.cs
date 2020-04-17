@@ -65,17 +65,17 @@ namespace BuildProgram
 
 		private static void RegisterWindowsArtifacts()
 		{
-			Artifacts.Add("android-ndk-r16b-windows",
+			Artifacts.Add("android-ndk-win",
 				new Tuple<string, string>(
-					"android-ndk-r16b-windows/9df1e3b3b120_403e0d58eabae03f0d9e8d1d2cea2dbf1d14c380c3d1c7eeb6e8c60ffc15e1b8.7z",
-					"testing"));
+					"android-ndk-win/r19-unity_ee15a8f43c980bbe7a1fe9ac072f5bcb85aada70cccd9852f4e777f54cc234b3.7z",
+					"unity-internal"));
 		}
 
 		private static void RegisterOSXArtifacts()
 		{
-			Artifacts.Add("android-ndk-r16b-darwin",
+			Artifacts.Add("android-ndk-mac",
 				new Tuple<string, string>(
-					"android-ndk-r16b-darwin/9df1e3b3b120_c7cda5a221dd72799b7e618597b3f8766df7183d386becb2785631c2d3ac0d75.7z",
+					"android-ndk-mac/r19-unity_8b169ff2a8234c85e0c5ba3c776aa94273cd3c15fdc96d213154970d87938589.7z",
 					"testing"));
 
 			Artifacts.Add("MacBuildEnvironment",
@@ -91,10 +91,10 @@ namespace BuildProgram
 
 		private static void RegisterLinuxArtifacts()
 		{
-			Artifacts.Add("android-ndk-r16b-linux",
+			Artifacts.Add("android-ndk-linux",
 				new Tuple<string, string>(
-					"android-ndk-r16b-linux/9df1e3b3b120_fbabd18208d82cbc810266e8b566bb0ea4e1e438de38d450a92deaa3e23757b6.7z",
-					"testing"));
+					"android-ndk-linux/r19-unity_0485c5b2fc49445102168d23dafb0176602a28a1e0dadb6e78eab722e32e2dd9.7z",
+					"unity-internal"));
 
 			Artifacts.Add("sysroot-gcc-glibc-x64",
 				new Tuple<string, string>(
