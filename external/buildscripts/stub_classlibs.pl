@@ -18,14 +18,23 @@ my $referenceProfile = "$profileRoot/4.7.1-api";
 
 print ">>> Modifying the unityjit profile to match the .NET 4.7.1 API\n";
 
-$result = system("mono",
-					"$extraBuildTools/ProfileStubber.exe",
-					"--reference-profile=$referenceProfile",
-					"--stub-profile=$profileRoot/unityjit");
+my @hostPlatforms = ();
+push @hostPlatforms, "win32";
+push @hostPlatforms, "macos";
+push @hostPlatforms, "linux";
 
-if ($result ne 0)
+foreach my $hostPlatform(@hostPlatforms)
 {
-	die("Failed to stub the unityjit profile\n");
+	my $platformProfile = "unityjit-$hostPlatform";
+	$result = system("mono",
+						"$extraBuildTools/ProfileStubber.exe",
+						"--reference-profile=$referenceProfile",
+						"--stub-profile=$profileRoot/$platformProfile");
+
+	if ($result ne 0)
+	{
+		die("Failed to stub the $platformProfile profile\n");
+	}
 }
 
 print ">>> Modifying the unityaot profile to match the .NET 4.7.1 API\n";
